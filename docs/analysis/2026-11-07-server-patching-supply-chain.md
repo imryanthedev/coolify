@@ -75,7 +75,7 @@ Le check et l’auto-update sont **indépendants** : le check peut être hebdoma
 - Données produites par mise à jour : paquet, version actuelle, nouvelle version, architecture, dépôt, `security`, `risk`.
 - Classification sécurité (`:257-273`) :
   - **apt** : vrai si la suite du candidat se termine par `-security` (`:263`). Cela couvre Debian `<codename>-security` et Ubuntu `-security`, `-apps-security`, `-infra-security`. **Nuance :** si le candidat vient de `-updates` avec une version plus récente que celle de `-security`, il n’est pas marqué sécurité, alors qu’il contient le correctif. De plus, Debian publie des correctifs de sécurité mineurs via les point releases (suite principale), donc sans `-security`.
-  - **dnf / zypper** : vrai si le **nom** du paquet figure dans un advisory sécurité (`:264`). La correspondance porte sur le nom, pas la version. Si la commande d’advisory échoue, le compteur sécurité vaut `null`.
+  - **dnf / zypper** : vrai si le **nom** du paquet figure dans un advisory sécurité (`:264`). La correspondance porte sur le nom, pas la version. **Si la commande d’advisory échoue, le compteur vaut `0`, pas `null`** : les deux commandes finissent par `exit 0` et leur sortie est castée en chaîne (`:65`, `:73`, `:199`, `:205`), donc une sortie vide donne une liste vide. Le docblock de `addUpdateDetails()` (`:253`) promet pourtant `null`. Un échec se lit donc comme « aucune mise à jour de sécurité ».
   - **pacman / apk** : le compteur vaut `null` (inconnu) ; chaque paquet a `security = false`. L’UI doit donc lire « inconnu », pas « aucune ».
 - `risk` : `docker`, `kernel`, `system` (`CheckUpdates.php:94-120`). Correspondance par motif glob.
 - `reboot_required` (`:83-85`) : `/var/run/reboot-required`, `needrestart`, `dnf needs-restarting`, `zypper needs-rebooting`.
@@ -206,6 +206,7 @@ C’est robuste (fonctionne même si Coolify est arrêté). C’est aussi ce qui
 9. **Pas de protection contre un paquet malveillant signé.** La signature protège contre un miroir compromis, pas contre un mainteneur ou un build compromis. Nuance utile : dans le cas xz (2024), la version piégée a été repérée avant d’atteindre Debian stable et les versions stables d’Ubuntu. Le délai entre « unstable/testing » et « stable/-security » joue déjà le rôle de cooldown sur ces distributions ; un cooldown supplémentaire a surtout de la valeur sur les dépôts **tiers** (Docker, NodeSource…) et les distributions rolling.
 10. **Détail apt** : le check affiche des mises à jour (méta-paquets kernel) que « Update all » ne peut pas installer, sans l’expliquer.
 11. **Détail apt** : la classification sécurité ignore un candidat `-updates` qui contient un correctif de sécurité.
+12. **Détail dnf/zypper** : un échec de la requête d’advisory affiche `0` mise à jour de sécurité au lieu de « inconnu » (voir 2.2).
 
 ---
 
@@ -250,7 +251,7 @@ Aucune issue ou discussion trouvée sur un âge minimum de paquet OS ou sur sock
 
 | Mécanisme | Granularité | Utilisable pour un cooldown ? |
 |---|---|---|
-| **Pin apt** (`Package: x` / `Pin: version 1.2-3` / `Pin-Priority: -1`) | Par version | **Oui** : bloque exactement la version trop récente, `unattended-upgrades` le respecte |
+| **Pin apt** (`Package: x:any` / `Pin: version 1.2-3` / `Pin-Priority: -1`) | Par version | **Oui** : bloque exactement la version trop récente, `unattended-upgrades` le respecte. Sans `:any` (ou un pin par architecture), le pin ne vise que l’architecture native (apt_preferences(5)) |
 | `Unattended-Upgrade::Package-Blacklist` | Par nom (regex) | Pour les **exclusions**, pas pour un âge (bloque toutes les versions) |
 | `dnf versionlock` (plugin) | Par version | Possible, mais plugin à installer ; un verrou empêche aussi une version plus récente |
 | `exclude` dans `[base]` de `automatic.conf` | Par nom/motif | Pour les exclusions dnf |
@@ -270,15 +271,17 @@ C’est le prérequis du reste.
 
 #### Option B — Cooldown via l’outil OS (recommandé pour apt)
 
-Un script et un `ExecStartPre` sur `apt-daily-upgrade.service`, poussés par Coolify :
+Un script poussé par Coolify, en `ExecStartPre` (étapes 1 à 3) et `ExecStartPost` (étape 5) sur `apt-daily-upgrade.service`, ou bien un service dédié qui encadre l’appel :
 
 1. lit la liste des candidats ;
 2. maintient un état local `paquet+version → première vue` (indépendant de Coolify) ;
-3. écrit un fichier de pins `Pin-Priority: -1` pour les versions plus jeunes que N jours ;
+3. écrit un fichier de pins `Pin-Priority: -1` pour **toutes** les versions installables plus récentes que la version installée et plus jeunes que N jours, pas seulement le candidat (`apt-cache madison` / `apt-cache policy`). Sinon : si `-updates` a 1.2 et `-security` 1.1, le candidat est 1.2, mais `unattended-upgrades` se rabat sur 1.1 (origine autorisée), qui contournerait le cooldown ;
 4. laisse `unattended-upgrades` tourner normalement ;
-5. écrit un résumé (installés, reportés, exclus) que le check suivant lit.
+5. après le service (`ExecStartPost`), écrit un résumé (installés, reportés, exclus) à partir de `/var/log/unattended-upgrades/` ou `/var/log/dpkg.log`, que le check suivant lit. Un `ExecStartPre` seul ne peut pas connaître le résultat.
 
-Les pins sont **laissés en place** et régénérés à chaque exécution : les retirer après coup ouvrirait une fenêtre où un `apt upgrade` manuel ignorerait le cooldown. L’UI doit les afficher pour éviter la confusion avec des pins de l’admin (fichier dédié, ex. `/etc/apt/preferences.d/coolify-cooldown`).
+Les pins sont **laissés en place** et régénérés à chaque exécution : les retirer après coup ouvrirait une fenêtre où un `apt upgrade` manuel ignorerait le cooldown. L’UI doit les afficher pour éviter la confusion avec des pins de l’admin (fichier dédié).
+
+**Conflit avec les pins existants :** pour une version donnée, apt applique le **premier** enregistrement spécifique qui correspond, et lit `preferences.d` dans l’ordre alphabétique (apt_preferences(5)). Un pin de l’admin lu avant le fichier Coolify peut donc annuler le `-1`. Il faut nommer le fichier pour qu’il soit lu en premier (ex. `/etc/apt/preferences.d/00-coolify-cooldown`), puis **vérifier la priorité effective** avec `apt-cache policy <pkg>` après génération. Si une version à bloquer n’a pas la priorité `-1`, le comportement sûr est de ne pas lancer `unattended-upgrades` pour ce paquet (Package-Blacklist temporaire) et de le signaler.
 
 Pour dnf : `exclude` régénéré dans `automatic.conf`, ou versionlock. Pour dnf/zypper, la date d’advisory peut remplacer la « première vue ».
 
@@ -357,7 +360,7 @@ Plan :
 | # | Cible | Titre | Contenu | Risque |
 |---|---|---|---|---|
 | 1 | `main` | `fix(server): make turning off automatic security updates explicit` | apt : écrire un fichier Coolify `APT::Periodic::Unattended-Upgrade "0";` au lieu de seulement supprimer (ou, si les mainteneurs préfèrent, libellé UI « Use OS defaults ») ; dnf : remettre `apply_updates = no` | Faible |
-| 2 | `main` | `fix(server): explain apt updates that need new packages` | Marquer « kept back » (nouvelle dépendance) les mises à jour absentes des deux simulations, comme `held`, avec un libellé clair ; ne pas les compter comme installables par « Update all » | Faible |
+| 2 | `main` | `fix(server): explain apt updates that need new packages` | Marquer « kept back » (nouvelle dépendance) les mises à jour absentes des deux simulations, avec un libellé clair. **Les laisser dans `updates`** (avec un drapeau, pas dans `held_updates`), car `Patches::updatePackage()` (`:109-114`) exige cette présence et l’update unitaire est le seul moyen de les installer depuis l’UI. Séparer « installable par Update all » de « installable seul » | Faible |
 | 3 | `next` | `feat(server): record when each package update was first seen` | Option A + date d’advisory dnf/zypper, affichage « disponible depuis » | Faible |
 | 4 | `next` | `feat(server): exclude packages from automatic security updates` | Liste d’exclusions → `Package-Blacklist` (apt), `exclude` (dnf) ; exclusions Docker proposées | Moyen |
 | 5 | `next` | `feat(server): report what automatic security updates installed` | Lecture de `/var/log/unattended-upgrades/` ou `dpkg.log`, journal `dnf-automatic`, notification succès/échec, détection de dérive de config | Faible à moyen |
@@ -375,7 +378,8 @@ Plan :
 
 **PR 2 (kept back)**
 
-- Un méta-paquet kernel qui exige un nouveau paquet apparaît avec une raison distincte, pas dans le compteur « installable ».
+- Un méta-paquet kernel qui exige un nouveau paquet apparaît avec une raison distincte, hors du compteur « installable par Update all ».
+- Il reste installable par l’update unitaire (bouton présent, `updatePackage()` l’accepte).
 - Les paquets `phased` et `held` sont toujours classés comme avant.
 - Tests unitaires sur des sorties de simulation `apt-get -s upgrade` réelles (Ubuntu 22.04 et 24.04).
 
@@ -453,3 +457,4 @@ Plan :
 
 - **Révision 1** (7 nov. 2026) : première analyse.
 - **Révision 2** (7 nov. 2026) : vérification ligne à ligne. Corrigé : phasing et sécurité, sémantique de « off » sur apt, dates d’advisory dnf/zypper, portée de #12472, `actions.lock`, cible `main`/`next`, catégorie de discussion, canal Pushover, numéros de ligne (`constants.php:26`, `upstream.json:8-10`), perte du résultat en cas d’erreur. Ajouté : plan d’action, critères d’acceptation, points UNVERIFIED.
+- **Révision 3** (7 nov. 2026) : après revue CodeRabbit. Corrigé : compteur sécurité dnf/zypper à `0` (pas `null`) en cas d’échec ; pins apt sur toutes les versions installables, avec `:any`, ordre de lecture et vérification de la priorité effective ; résumé produit après l’installation ; PR 2 garde l’update unitaire des paquets kept back.
